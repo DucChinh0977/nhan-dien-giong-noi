@@ -1,143 +1,172 @@
+# train.py
 import os
 import torch
-import torch.nn as nn
-import librosa
-import noisereduce as nr
-from transformers import Wav2Vec2Processor, Wav2Vec2Model
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-import pickle
+import torchaudio
 import numpy as np
-from tqdm import tqdm
+import random
+from datasets import Dataset, Audio
+from transformers import (
+    Wav2Vec2FeatureExtractor,
+    Wav2Vec2ForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    EarlyStoppingCallback
+)
 
-# Kiểm tra CUDA
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-if device.type == "cuda":
-    print(f"Device name: {torch.cuda.get_device_name(0)}")
 
-# Load mô hình Wav2Vec2
-MODEL_NAME = "nguyenvulebinh/wav2vec2-base-vietnamese-250h"
-processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
-embedding_model = Wav2Vec2Model.from_pretrained(MODEL_NAME).to(device)
+# Hàm fine-tune cho Speaker Identification
+def train_speaker_identification():
+    # Định nghĩa nhãn cho 3 người nói
+    label_map = {"chinh": 0, "viet": 1, "VietLoi": 2}
+    sample_rate = 16000
 
-# Cấu hình âm thanh
-SAMPLING_RATE = 16000
+    # Chuẩn bị dữ liệu
+    dataset_path = "D:/nhandang/samples"
+    data = []
+    for speaker, label in label_map.items():
+        speaker_path = os.path.join(dataset_path, speaker)
+        for file in os.listdir(speaker_path):
+            if file.endswith(".wav"):
+                file_path = os.path.join(speaker_path, file)
+                data.append({"path": file_path, "label": torch.tensor(label, dtype=torch.long)})
 
-# Dataset tùy chỉnh để tải dữ liệu song song
-class AudioDataset(Dataset):
-    def __init__(self, directory, max_length=500):  # Giảm max_length
-        self.audio_files = []
-        self.labels = []
-        self.label_map = {}
-        idx = 0
+    dataset = Dataset.from_list(data)
+    dataset = dataset.cast_column("path", Audio(sampling_rate=sample_rate))
 
-        for speaker_name in os.listdir(directory):
-            if speaker_name not in self.label_map:
-                self.label_map[speaker_name] = idx
-                idx += 1
-            speaker_path = os.path.join(directory, speaker_name)
-            if os.path.isdir(speaker_path):
-                for file in os.listdir(speaker_path):
-                    if file.endswith(".wav"):
-                        self.audio_files.append(os.path.join(speaker_path, file))
-                        self.labels.append(self.label_map[speaker_name])
-        self.max_length = max_length
+    # Tải feature extractor từ mô hình nhỏ hơn
+    model_name = "facebook/wav2vec2-base"
+    print("Tải feature extractor cho speaker identification...")
+    try:
+        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
+        print("Feature extractor đã được tải thành công!")
+    except Exception as e:
+        print(f"Lỗi khi tải feature extractor: {e}")
+        return
 
-    def __len__(self):
-        return len(self.audio_files)
+    # Hàm tăng cường dữ liệu
+    def augment_audio(waveform, sample_rate):
+        print(f"Waveform dtype before augmentation: {waveform.dtype}")
 
-    def __getitem__(self, idx):
-        audio_path = self.audio_files[idx]
-        label = self.labels[idx]
-        audio_data, _ = librosa.load(audio_path, sr=SAMPLING_RATE)
-        embedding = self.extract_embedding(audio_data)
-        return torch.tensor(embedding, dtype=torch.float32), label
+        # Thêm tiếng ồn
+        noise = torch.randn_like(waveform) * 0.005
+        waveform = waveform + noise
 
-    def extract_embedding(self, audio_data):
-        audio_data = librosa.util.normalize(audio_data)
-        audio_data = nr.reduce_noise(y=audio_data, sr=SAMPLING_RATE, stationary=False, prop_decrease=0.95, time_constant_s=2.0)
-        inputs = processor(audio_data, sampling_rate=SAMPLING_RATE, return_tensors="pt", padding=True)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = embedding_model(**inputs)
-        embeddings = outputs.last_hidden_state.squeeze(0)  # (seq_len, 768)
-        # Pooling để giảm sequence length
-        embeddings = nn.functional.adaptive_avg_pool1d(embeddings.T, self.max_length).T  # (max_length, 768)
-        return embeddings.cpu().numpy()
+        # Thay đổi âm lượng (Volume Perturbation)
+        volume_factor = random.uniform(0.5, 1.5)
+        waveform = waveform * volume_factor
 
-# Mô hình Transformer nhẹ hơn
-class SpeakerTransformer(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, num_heads=4, dropout=0.1):
-        super(SpeakerTransformer, self).__init__()
-        self.input_proj = nn.Linear(input_size, hidden_size)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=hidden_size * 2,  # Giảm FFN size
-            dropout=dropout,
-            batch_first=True
+        print(f"Waveform dtype after augmentation: {waveform.dtype}")
+        return waveform
+
+    # Hàm tiền xử lý dữ liệu
+    def preprocess_function(batch):
+        audio_array = batch["path"]["array"]
+        if not isinstance(audio_array, np.ndarray):
+            audio_array = np.array(audio_array, dtype=np.float32)
+
+        # Chuyển đổi thành tensor với dtype=float32
+        waveform = torch.tensor(audio_array, dtype=torch.float32).unsqueeze(0)  # Shape: (1, seq_length)
+
+        # Tăng cường dữ liệu
+        waveform = augment_audio(waveform, sample_rate)
+
+        # Xử lý đầu vào bằng feature extractor
+        inputs = feature_extractor(
+            waveform.squeeze(0).numpy(),
+            sampling_rate=sample_rate,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=80000
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(hidden_size, num_classes)
+        # Đảm bảo input_values có shape [seq_length]
+        batch["input_values"] = inputs.input_values.squeeze(0)  # Shape: [seq_length]
 
-    def forward(self, x):
-        x = self.input_proj(x)  # (batch, seq_len, hidden_size)
-        x = self.transformer(x)  # (batch, seq_len, hidden_size)
-        x = x.mean(dim=1)  # (batch, hidden_size)
-        out = self.fc(x)  # (batch, num_classes)
-        return out
-
-# Huấn luyện mô hình
-def train_speaker_model(directory, input_size=768, hidden_size=128, num_layers=2, epochs=200, max_length=500):
-    dataset = AudioDataset(directory, max_length=max_length)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=4)  # Song song hóa với 4 workers
-
-    print(f"Label map: {dataset.label_map}")
-    print(f"Total samples: {len(dataset)}")
-
-    num_classes = len(dataset.label_map)
-    model = SpeakerTransformer(input_size, hidden_size, num_layers, num_classes).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
-
-    best_loss = float('inf')
-    patience = 30
-    patience_counter = 0
-
-    for epoch in range(epochs):
-        model.train()
-        epoch_loss = 0
-        for batch_X, batch_y in tqdm(dataloader, desc=f"Epoch [{epoch + 1}/{epochs}]"):
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            epoch_loss += loss.item()
-        scheduler.step()
-        avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch [{epoch + 1}/{epochs}], Loss: {avg_loss:.4f}, LR: {optimizer.param_groups[0]['lr']}")
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), "speaker_model.pth")
-            with open("label_map.pkl", "wb") as f:
-                pickle.dump(dataset.label_map, f)
+        # Đảm bảo nhãn là torch.long
+        label = batch["label"]
+        if isinstance(label, torch.Tensor):
+            batch["label"] = label.to(dtype=torch.long)
         else:
-            patience_counter += 1
-        if patience_counter >= patience:
-            print(f"Early stopping triggered at epoch {epoch + 1}!")
-            break
+            batch["label"] = torch.tensor(label, dtype=torch.long)
 
-    print("Mô hình và label_map đã được lưu!")
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-        print("Đã giải phóng bộ nhớ GPU!")
+        return batch
+
+    dataset = dataset.map(preprocess_function, remove_columns=["path"])
+    dataset = dataset.train_test_split(test_size=0.2)
+    train_dataset = dataset["train"]
+    test_dataset = dataset["test"]
+
+    # Tải mô hình để fine-tune
+    print("Tải mô hình để fine-tune speaker identification...")
+    try:
+        model = Wav2Vec2ForSequenceClassification.from_pretrained(
+            model_name, num_labels=len(label_map), problem_type="single_label_classification"
+        )
+        model.config.dropout = 0.3
+        print("Mô hình đã được tải thành công!")
+    except Exception as e:
+        print(f"Lỗi khi tải mô hình: {e}")
+        return
+
+    # Cấu hình huấn luyện
+    training_args = TrainingArguments(
+        output_dir="./wav2vec2_speaker_id",
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=1e-5,
+        per_device_train_batch_size=1,
+        per_device_eval_batch_size=1,
+        num_train_epochs=15,
+        weight_decay=0.01,
+        save_total_limit=2,
+        logging_dir="./logs",
+        fp16=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_accuracy",
+        greater_is_better=True,
+        gradient_checkpointing=True  # Sửa cảnh báo gradient_checkpointing
+    )
+
+    # Hàm tính toán độ chính xác
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = np.argmax(logits, axis=-1)
+        accuracy = (predictions == labels).mean()
+        return {"eval_accuracy": accuracy}
+
+    # Hàm collate tùy chỉnh
+    def custom_collate_fn(batch):
+        # Đảm bảo input_values là tensor và có shape [seq_length]
+        input_values = [item["input_values"] if isinstance(item["input_values"], torch.Tensor) else torch.tensor(
+            item["input_values"], dtype=torch.float32) for item in batch]
+        input_values = torch.stack(input_values)  # Shape: [batch_size, seq_length]
+        labels = torch.tensor([item["label"] for item in batch], dtype=torch.long)
+        print(f"Input values shape: {input_values.shape}, dtype: {input_values.dtype}")
+        return {"input_values": input_values, "labels": labels}
+
+    # Khởi tạo Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=test_dataset,
+        tokenizer=feature_extractor,
+        data_collator=custom_collate_fn,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(
+            early_stopping_patience=3,
+            early_stopping_threshold=0.01
+        )]
+    )
+
+    # Huấn luyện và lưu mô hình
+    print("Bắt đầu huấn luyện mô hình speaker identification...")
+    trainer.train()
+    trainer.evaluate()
+    trainer.save_model("wav2vec2_speaker_id_model")
+    feature_extractor.save_pretrained("wav2vec2_speaker_id_model")
+    print("Huấn luyện speaker identification hoàn tất!")
+
 
 if __name__ == "__main__":
-    train_speaker_model("samples/")
+    train_speaker_identification()

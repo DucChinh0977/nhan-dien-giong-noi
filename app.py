@@ -1,136 +1,178 @@
-import os
+# app.py
+import pyaudio
 import numpy as np
-import sounddevice as sd
 import torch
-import torch.nn as nn
-import librosa
-import noisereduce as nr
-from transformers import Wav2Vec2Processor, Wav2Vec2Model, Wav2Vec2ForCTC
-from silero_vad import get_speech_timestamps, load_silero_vad
-from flask import Flask, render_template
-from flask_socketio import SocketIO
-import pickle
+import torchaudio
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor, Wav2Vec2ForSequenceClassification, Wav2Vec2FeatureExtractor
+import wave
+import os
+import time
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-if device.type == "cuda":
-    print(f"Device name: {torch.cuda.get_device_name(0)}")
+# Cấu hình Silero VAD
+torch.set_num_threads(1)
+vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
+(get_speech_timestamps, _, read_audio, *_) = utils
 
-app = Flask(__name__)
-socketio = SocketIO(app)
-
-MODEL_NAME = "nguyenvulebinh/wav2vec2-base-vietnamese-250h"
-processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
-speech_to_text_model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME).to(device)
-embedding_model = Wav2Vec2Model.from_pretrained(MODEL_NAME).to(device)
-vad_model = load_silero_vad().to(device)
-
-SAMPLING_RATE = 16000
+# Cấu hình ghi âm
+CHUNK = 512
+FORMAT = pyaudio.paInt16
 CHANNELS = 1
-CHUNK_SIZE = SAMPLING_RATE * 3
-audio_buffer = []
+RATE = 16000
+SILENCE_DURATION = 1.0
+SPEECH_THRESHOLD = 0.5
+MIN_SPEECH_DURATION = 0.3
 
-def preprocess_audio(audio_data, sr=SAMPLING_RATE):
-    audio_data = librosa.util.normalize(audio_data)
-    audio_data = nr.reduce_noise(y=audio_data, sr=sr, stationary=False, prop_decrease=0.95, time_constant_s=2.0)
-    return audio_data
+# Cấu hình mô hình Speech-to-Text
+STT_MODEL_PATH = "wav2vec2_vietnamese_speech_to_text_model"
+stt_processor = Wav2Vec2Processor.from_pretrained(STT_MODEL_PATH)
+stt_model = Wav2Vec2ForCTC.from_pretrained(STT_MODEL_PATH)
+stt_model.eval()
 
-def extract_sequence_embeddings(audio_data, max_length=1000):  # Tăng max_length
-    audio_data = preprocess_audio(audio_data)
-    inputs = processor(audio_data, sampling_rate=SAMPLING_RATE, return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+# Cấu hình mô hình Speaker Identification
+SPEAKER_MODEL_PATH = "wav2vec2_speaker_id_model"
+speaker_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(SPEAKER_MODEL_PATH)
+speaker_model = Wav2Vec2ForSequenceClassification.from_pretrained(SPEAKER_MODEL_PATH)
+speaker_model.eval()
+
+# Ánh xạ nhãn người nói
+label_map = {0: "Chinh", 1: "Viet", 2: "VietLoi"}
+
+# Khởi tạo PyAudio
+p = pyaudio.PyAudio()
+stream = p.open(format=FORMAT,
+                channels=CHANNELS,
+                rate=RATE,
+                input=True,
+                frames_per_buffer=CHUNK)
+
+
+# Hàm nhận dạng người nói
+def identify_speaker(audio_path):
+    waveform, sample_rate = torchaudio.load(audio_path)
+    if sample_rate != 16000:
+        waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
+
+    inputs = speaker_feature_extractor(
+        waveform.squeeze(0),
+        sampling_rate=16000,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=80000
+    )
     with torch.no_grad():
-        outputs = embedding_model(**inputs)
-    embeddings = outputs.last_hidden_state.squeeze(0)
-    embeddings = nn.functional.adaptive_avg_pool1d(embeddings.T, max_length).T
-    if embeddings.size(0) < max_length:
-        padding = torch.zeros(max_length - embeddings.size(0), embeddings.size(1)).to(device)
-        embeddings = torch.cat([embeddings, padding], dim=0)
-    return embeddings.cpu().numpy()
+        logits = speaker_model(inputs.input_values).logits
+    predicted_id = torch.argmax(logits, dim=-1).item()
+    speaker = label_map[predicted_id]
+    return speaker
 
-class SpeakerTransformer(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, num_heads=4, dropout=0.3):
-        super(SpeakerTransformer, self).__init__()
-        self.input_proj = nn.Linear(input_size, hidden_size)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=num_heads,
-            dim_feedforward=hidden_size * 2,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.fc = nn.Linear(hidden_size, num_classes)
 
-    def forward(self, x):
-        x = self.input_proj(x)
-        x = self.transformer(x)
-        x = x.mean(dim=1)
-        out = self.fc(x)
-        return out
+# Hàm chuyển đổi âm thanh thành văn bản
+def speech_to_text(audio_path):
+    waveform, sample_rate = torchaudio.load(audio_path)
+    if sample_rate != 16000:
+        waveform = torchaudio.transforms.Resample(sample_rate, 16000)(waveform)
 
-def load_model_and_label_map(model_path="speaker_model.pth", label_map_path="label_map.pkl", input_size=768, hidden_size=128, num_layers=2):
-    if not os.path.exists(model_path) or not os.path.exists(label_map_path):
-        raise FileNotFoundError("Model hoặc label_map file không tồn tại. Hãy chạy train.py trước!")
-    with open(label_map_path, "rb") as f:
-        label_map = pickle.load(f)
-    num_classes = len(label_map)
-    model = SpeakerTransformer(input_size, hidden_size, num_layers, num_classes).to(device)
-    model.load_state_dict(torch.load(model_path))
-    model.eval()
-    print("Mô hình và label_map đã được tải!")
-    return model, label_map
-
-def identify_speaker(audio_data, model, label_map, max_length=1000):
-    embedding = extract_sequence_embeddings(audio_data, max_length)
-    embedding_tensor = torch.tensor([embedding], dtype=torch.float32).to(device)
-    model.eval()
+    inputs = stt_processor(waveform.squeeze(0), sampling_rate=16000, return_tensors="pt", padding=True)
     with torch.no_grad():
-        output = model(embedding_tensor)
-        probas = torch.softmax(output, dim=1)[0]
-        print(f"Probabilities for speakers {list(label_map.keys())}: {probas.tolist()}")
-        best_idx = torch.argmax(probas)
-        best_speaker = [k for k, v in label_map.items() if v == best_idx.item()][0]
-        return best_speaker if probas[best_idx] > 0.3 else None
-
-def speech_to_text(audio_data):
-    audio_data = preprocess_audio(audio_data)
-    inputs = processor(audio_data, sampling_rate=SAMPLING_RATE, return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        logits = speech_to_text_model(**inputs).logits
+        logits = stt_model(inputs.input_values).logits
     predicted_ids = torch.argmax(logits, dim=-1)
-    return processor.decode(predicted_ids[0])
+    transcription = stt_processor.batch_decode(predicted_ids)[0]
+    return transcription
 
-def process_audio(model, label_map):
-    print("🔴 Hệ thống đang lắng nghe...")
-    def callback(indata, frames, time, status):
-        global audio_buffer
-        if status:
-            print(f"⚠️ Lỗi: {status}")
-        indata = np.clip(indata, -1.0, 1.0)
-        audio_buffer.extend(indata[:, 0])
-        while len(audio_buffer) >= CHUNK_SIZE:
-            chunk = audio_buffer[:CHUNK_SIZE]
-            audio_buffer = audio_buffer[CHUNK_SIZE:]
-            audio_tensor = torch.tensor(np.array(chunk), dtype=torch.float32)
-            speech_timestamps = get_speech_timestamps(audio_tensor.to(device), vad_model, sampling_rate=SAMPLING_RATE)
-            if speech_timestamps:
-                print("🎙 Phát hiện giọng nói...")
-                speaker = identify_speaker(audio_tensor.numpy(), model, label_map)
-                if speaker:
-                    text = speech_to_text(audio_tensor.numpy())
-                    print(f"🗣 [{speaker}]: {text}")
-                    socketio.emit("transcription", {"speaker": speaker, "text": text})
-                else:
-                    print("⚠️ Giọng nói không xác định, bỏ qua...")
-    with sd.InputStream(samplerate=SAMPLING_RATE, channels=CHANNELS, callback=callback):
-        socketio.run(app, host="0.0.0.0", port=5000, debug=True, allow_unsafe_werkzeug=True)
 
-@app.route("/")
-def index():
-    return render_template("index.html")
+# Hàm lưu đoạn âm thanh vào file .wav
+def save_audio(frames, filename):
+    wf = wave.open(filename, 'wb')
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(p.get_sample_size(FORMAT))
+    wf.setframerate(RATE)
+    wf.writeframes(b''.join(frames))
+    wf.close()
+
+
+# Hàm phát hiện giọng nói bằng Silero VAD
+def detect_speech(audio_chunk):
+    audio_int16 = np.frombuffer(audio_chunk, dtype=np.int16)
+    audio_float32 = audio_int16.astype(np.float32) / 32768.0
+    audio_tensor = torch.tensor(audio_float32)
+    speech_prob = vad_model(audio_tensor, RATE).item()
+    return speech_prob > SPEECH_THRESHOLD
+
+
+# Hàm lưu kết quả vào file
+def save_result(speaker, transcription):
+    with open("results.txt", "a", encoding="utf-8") as f:
+        f.write(f"{speaker}: {transcription}\n")
+
+
+# Hàm chính để ghi âm và xử lý theo thời gian thực
+def main():
+    print("Bắt đầu chương trình Speech-to-Text với VAD và Speaker Identification...")
+    print("Đang lắng nghe... Nói để ghi âm, im lặng trong 1 giây để dừng.")
+
+    audio_buffer = []
+    is_speaking = False
+    silence_start = None
+    recording_count = 0
+
+    # Xóa file results.txt nếu đã tồn tại
+    if os.path.exists("results.txt"):
+        os.remove("results.txt")
+
+    while True:
+        try:
+            data = stream.read(CHUNK, exception_on_overflow=False)
+
+            if detect_speech(data):
+                if not is_speaking:
+                    print("🗣️ Phát hiện giọng nói, bắt đầu ghi âm...")
+                    is_speaking = True
+                    audio_buffer = []
+                audio_buffer.append(data)
+                silence_start = None
+            else:
+                if is_speaking:
+                    if silence_start is None:
+                        silence_start = time.time()
+                    elif time.time() - silence_start >= SILENCE_DURATION:
+                        print("🤫 Im lặng, dừng ghi âm...")
+                        is_speaking = False
+
+                        recording_count += 1
+                        audio_path = f"recording_{recording_count}.wav"
+                        save_audio(audio_buffer, audio_path)
+
+                        waveform, _ = torchaudio.load(audio_path)
+                        duration = waveform.shape[1] / RATE
+                        if duration < MIN_SPEECH_DURATION:
+                            print(f"Đoạn âm thanh quá ngắn ({duration:.2f} giây), bỏ qua...")
+                            os.remove(audio_path)
+                            continue
+
+                        print("Nhận dạng người nói...")
+                        speaker = identify_speaker(audio_path)
+
+                        print("Chuyển đổi âm thanh thành văn bản...")
+                        transcription = speech_to_text(audio_path)
+                        print(f"{speaker}: {transcription}")
+
+                        # Lưu kết quả vào file
+                        save_result(speaker, transcription)
+
+                        os.remove(audio_path)
+
+            if not is_speaking:
+                audio_buffer = []
+
+        except KeyboardInterrupt:
+            print("\nDừng chương trình...")
+            break
+
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+
 
 if __name__ == "__main__":
-    model, label_map = load_model_and_label_map()
-    process_audio(model, label_map)
+    main()

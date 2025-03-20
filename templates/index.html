@@ -1,31 +1,25 @@
-    <!DOCTYPE html>
-    <html lang="vi">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Nhận dạng giọng nói</title>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-        <style>
-            body { font-family: Arial, sans-serif; text-align: center; }
-            .container { max-width: 600px; margin: 50px auto; }
-            .speaker { font-weight: bold; color: blue; }
-            .message { font-size: 18px; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🗣 Nhận diện giọng nói theo thời gian thực</h1>
-            <div id="output"></div>
-        </div>
-
-        <script>
-            var socket = io();
-            socket.on("transcription", function(data) {
-                var outputDiv = document.getElementById("output");
-                var newMessage = document.createElement("p");
-                newMessage.innerHTML = `<span class="speaker">${data.speaker}:</span> <span class="message">${data.text}</span>`;
-                outputDiv.appendChild(newMessage);
-            });
-        </script>
-    </body>
-    </html>
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech-to-Text with Speaker Identification</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <h1>Speech-to-Text with Speaker Identification</h1>
+    <p>Results from local recording:</p>
+    <div id="result">
+        {% if results %}
+            <ul>
+                {% for result in results %}
+                    <li>{{ result.strip() }}</li>
+                {% endfor %}
+            </ul>
+        {% else %}
+            <p>No results yet. Start recording in app.py to see results here.</p>
+        {% endif %}
+    </div>
+</body>
+</html>
