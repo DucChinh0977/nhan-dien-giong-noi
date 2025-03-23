@@ -48,14 +48,18 @@ Duration: Any length (scripts will handle padding/truncation for STT)
 
 
 How It Works
+
 Speaker Identification (train.py):
+
 Fine-tunes a Wav2Vec2 model (facebook/wav2vec2-base) for classifying speakers.
+
 Applies data augmentation (noise addition, volume perturbation) to improve robustness.
 Outputs a model that identifies 
 Speech-to-Text (train1.py):
 Fine-tunes a pre-trained Vietnamese Wav2Vec2 model (nguyenvulebinh/wav2vec2-base-vietnamese-250h) for STT.
 Standardizes audio to 30 seconds, applies data augmentation (noise, pitch shift).
 Outputs a model that transcribes Vietnamese speech into text.
+
 Speech Processing (app.py):
 Uses Silero VAD to detect speech and automatically start/stop recording.
 Identifies the speaker using the model from train.py.
@@ -64,6 +68,7 @@ Sends the results (speaker and transcription) to the web app.
 Web Interface (web_app.py and templates/index.html):
 Displays the meeting transcript with speaker labels.
 Updates in real-time as new speech is processed.
+
 Troubleshooting
 Error: "No speech detected":
 Ensure your microphone is working and there is no excessive background noise.
@@ -71,12 +76,15 @@ Adjust the VAD_THRESHOLD in app.py (e.g., lower to 0.3 if speech is not detected
 Poor STT accuracy:
 The STT model may not perform well due to limited training data. Add more .wav and .txt files to D:/nhandang/samples.
 Alternatively, use Google Speech-to-Text for better accuracy.
+
 Slow performance:
 Use a GPU for faster training and inference.
 Reduce CHUNK_DURATION in app.py to process smaller audio chunks.
+
 Web interface not updating:
 Ensure web_app.py is running before starting app.py.
 Check the console for errors in web_app.py.
+
 Future Improvements
 Improve STT accuracy: Use Google Speech-to-Text or collect more Vietnamese training data.
 Add more speakers: Expand the speaker identification model to support more speakers.
