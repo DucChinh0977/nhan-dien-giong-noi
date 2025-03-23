@@ -18,7 +18,9 @@ whisp.py: (Optional) Additional script for speech processing (not used in the ma
 
 Requirements
 Python: 3.8 or higher
+
 Hardware: A microphone for recording audio; GPU recommended for faster training and inference
+
 Operating System: Windows, macOS, or Linux
 
 Python Libraries
@@ -31,31 +33,14 @@ The project requires audio data for training the models. The data should be orga
 Directory Structure:
 Create a directory D:/nhandang/samples (or modify the path in the scripts to match your setup).
 Inside D:/nhandang/samples, create subdirectories for each speaker
- This is example for D:/nhandang/samples/
-├── person1/
-│   ├── audio1.wav
-│   ├── audio1.txt
-│   ├── audio2.wav
-│   ├── audio2.txt
-│   └── ...
-├── person2/
-│   ├── audio1.wav
-│   ├── audio1.txt
-│   ├── audio2.wav
-│   ├── audio2.txt
-│   └── ...
-├── person3/
-│   ├── audio1.wav
-│   ├── audio1.txt
-│   ├── audio2.wav
-│   ├── audio2.txt
-│   └── ...
-
+ 
 Data Requirements:
 For train.py (Speaker Identification): Only .wav files are needed. Each subdirectory (person1, person2, person3) should contain audio files for the corresponding speaker.
-For train1.py (Speech-to-Text): Each .wav file must have a corresponding .txt file with the same name, containing the transcript of the audio. For example, audio1.wav should have a audio1.txt file with the text content (e.g., "Xin chào mọi người").
-ư
+
+For train1.py (Speech-to-Text): Each .wav file must have a corresponding .txt file with the same name, containing the transcript of the audio. For example, audio1.wav should have a audio1.txt file with the text
+content (e.g., "Xin chào mọi người").
 ecommendation: Use at least 50-100 audio files per speaker for better model performance.
+
 Audio Specifications:
 Format: .wav
 Sampling rate: 16 kHz (if different, the scripts will resample automatically)
@@ -100,17 +85,3 @@ Advanced noise reduction: Integrate more sophisticated denoising techniques (e.g
 Contributing
 Contributions are welcome! If you have ideas for improvements or bug fixes, please:
 
-Fork the repository.
-Create a new branch (git checkout -b feature/your-feature).
-Commit your changes (git commit -m "Add your feature").
-Push to the branch (git push origin feature/your-feature).
-Open a pull request.
-License
-This project is licensed under the MIT License. See the  file for details.
-
-Notes for the README
-Repository URL: I have updated the repository URL to https://github.com/DucChinh0977/nhan-dien-giong-noi based on the screenshot.
-Banner Image: The placeholder banner (https://via.placeholder.com/800x200.png?text=Speech+Recognition+System) can be replaced with a screenshot of your web interface or a demo image. You can upload an image to the repository and link it in the README.
-License: If you haven't added a LICENSE file, you can create one using the MIT License template or choose another license that suits your needs.
-Vietnamese Description: I added a Vietnamese description to make the project more accessible to Vietnamese users.
-This README provides a comprehensive guide for users to understand, set up, and use your project. If you need any adjustments or additional sections, let me know!
